@@ -172,7 +172,7 @@ pkg
 *.sqlite
 *.pem
 *.tgz
-*.mp3
+
 *.ogg
 /moshi-demo/config.sh
 log.*
