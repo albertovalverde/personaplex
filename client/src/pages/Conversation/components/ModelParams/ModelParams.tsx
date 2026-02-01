@@ -38,6 +38,7 @@ export const ModelParams:FC<ModelParamsProps> = ({
               <td className="w-12 text-center">{modalVoicePrompt}</td>
               <td className="p-2">
                 <select className="align-middle bg-white text-black border border-gray-300 rounded px-2 py-1" disabled={isConnected} id="voice-prompt" name="voice-prompt" value={modalVoicePrompt} onChange={e => setModalVoicePrompt(e.target.value)}>
+                  <option value="pepper.pt">PEPPER.pt</option>
                   <option value="NATF0.pt">NATF0.pt</option>
                   <option value="NATF1.pt">NATF1.pt</option>
                   <option value="NATF2.pt">NATF2.pt</option>

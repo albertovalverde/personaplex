@@ -104,13 +104,18 @@ const Homepage = ({
             onChange={(e) => setVoicePrompt(e.target.value)}
             className="w-full p-3 bg-white text-black border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
           >
+            {/* Opción PEPPER.pt */}
+            <option value="pepper.pt">PEPPER.pt</option>
+
             {VOICE_OPTIONS.map((voice) => (
-              <option key={voice} value={voice}>
-                {voice
-                  .replace('.pt', '')
-                  .replace(/^NAT/, 'NATURAL_')
-                  .replace(/^VAR/, 'VARIETY_')}
-              </option>
+               <option key={voice} value={voice}>
+                  {voice === "pepper.pt"
+                    ? "PEPPER"
+                    : voice
+                        .replace('.pt', '')
+                        .replace(/^NAT/, 'NATURAL_')
+                        .replace(/^VAR/, 'VARIETY_')}
+                </option>
             ))}
           </select>
       </div>
