@@ -35,6 +35,8 @@ import time
 import secrets
 import sys
 from typing import Literal, Optional
+import json
+import zenoh
 
 import aiohttp
 from aiohttp import web
@@ -93,6 +95,12 @@ class ServerState:
     text_tokenizer: sentencepiece.SentencePieceProcessor
     lm_gen: LMGen
     lock: asyncio.Lock
+    zenoh_session: Optional[zenoh.Session] = None
+    zenoh_mic_pub: Optional[zenoh.Publisher] = None
+    zenoh_speaker_sub: Optional[zenoh.Subscriber] = None
+    zenoh_transcription_pub: Optional[zenoh.Publisher] = None
+    zenoh_ctrl_pub: Optional[zenoh.Publisher] = None
+    ws_active: Optional[web.WebSocketResponse] = None
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
@@ -115,6 +123,24 @@ class ServerState:
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
+
+    def setup_zenoh(self, use_zenoh: bool):
+        if use_zenoh:
+            try:
+                conf = zenoh.Config()
+                self.zenoh_session = zenoh.open(conf)
+                self.zenoh_mic_pub = self.zenoh_session.declare_publisher("pepper/audio/mic")
+                self.zenoh_transcription_pub = self.zenoh_session.declare_publisher("pepper/audio/transcription")
+                self.zenoh_ctrl_pub = self.zenoh_session.declare_publisher("pepper/personaplex/control")
+                self.zenoh_speaker_sub = self.zenoh_session.declare_subscriber("pepper/audio/speaker", self._on_zenoh_speaker_data)
+                logger.info("Zenoh bridge initialized in server state")
+            except Exception as e:
+                logger.error(f"Failed to initialize Zenoh: {e}")
+
+    def _on_zenoh_speaker_data(self, sample):
+        # We don't bridge speaker BACK to the UI from Zenoh in this specific mode 
+        # unless requested, but we could if we wanted the UI to hear Pepper's speaker.
+        pass
     
     def warmup(self):
         for _ in range(4):
@@ -135,6 +161,7 @@ class ServerState:
     async def handle_chat(self, request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        self.ws_active = ws
         clog = ColorizedLog.randomize()
         peer = request.remote  # IP
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
@@ -195,6 +222,11 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:  # audio
                         payload = message[1:]
+                        if self.zenoh_mic_pub:
+                            # Bridge UI audio to Zenoh Pepper Mic topic
+                            # Convert to format robot expects if needed (usually mono 16bit)
+                            # For now, we assume bridge handles it or we send as is
+                            self.zenoh_mic_pub.put(payload)
                         opus_reader.append_bytes(payload)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
@@ -237,6 +269,9 @@ class ServerState:
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
+                            if self.zenoh_transcription_pub:
+                                logger.info(f"ZENOH PUB: {_text}")
+                                self.zenoh_transcription_pub.put(_text)
                             msg = b"\x02" + bytes(_text, encoding="utf8")
                             await ws.send_bytes(msg)
                         else:
@@ -399,6 +434,7 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument("--zenoh", action="store_true", help="Enable Zenoh bridge to pepper/OM1 topics")
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -463,6 +499,7 @@ def main():
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
     )
+    state.setup_zenoh(args.zenoh)
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
