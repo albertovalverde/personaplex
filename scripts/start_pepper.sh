@@ -6,7 +6,14 @@ OM1_ROOT="$(dirname "$PROJECT_ROOT")/OM1"
 LOG_DIR="$PROJECT_ROOT/logs"
 
 # Environment Variables
-export HF_TOKEN="tu_token_aqui"
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
+fi
+
+if [ -z "$HF_TOKEN" ]; then
+    echo -e "${RED}Error: HF_TOKEN is not set. Please set it in your environment or in a .env file.${NC}"
+    exit 1
+fi
 export REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
 
 # Colors for output

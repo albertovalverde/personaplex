@@ -129,18 +129,57 @@ class ServerState:
             try:
                 conf = zenoh.Config()
                 self.zenoh_session = zenoh.open(conf)
-                self.zenoh_mic_pub = self.zenoh_session.declare_publisher("pepper/audio/mic")
+                
+                # Audio Input (Robot Mic -> Moshi)
+                # We subscribe to the MIC topic to receive audio from the robot
+                self.zenoh_mic_sub = self.zenoh_session.declare_subscriber("pepper/audio/mic", self._on_zenoh_mic_data)
+                
+                # Audio Output (Moshi -> Robot Speaker)
+                self.zenoh_speaker_pub = self.zenoh_session.declare_publisher("pepper/audio/speaker")
+                
+                # Control/Text Injection (From OM1)
+                # pepper/control is for motor bridge (we ignore here)
+                # pepper/personaplex/control is for filling/thinking
+                self.zenoh_ctrl_sub = self.zenoh_session.declare_subscriber("pepper/personaplex/control", self._on_zenoh_control)
+                
+                # pepper/audio/speaker/text is for OM1 to command speech
+                self.zenoh_text_sub = self.zenoh_session.declare_subscriber("pepper/audio/speaker/text", self._on_zenoh_text)
+                
+                # Transcription Output (Moshi -> OM1)
                 self.zenoh_transcription_pub = self.zenoh_session.declare_publisher("pepper/audio/transcription")
-                self.zenoh_ctrl_pub = self.zenoh_session.declare_publisher("pepper/personaplex/control")
-                self.zenoh_speaker_sub = self.zenoh_session.declare_subscriber("pepper/audio/speaker", self._on_zenoh_speaker_data)
-                logger.info("Zenoh bridge initialized in server state")
+                
+                logger.info("Zenoh bridge initialized: Topics for OM1 (transcription/control/text) active.")
             except Exception as e:
                 logger.error(f"Failed to initialize Zenoh: {e}")
 
-    def _on_zenoh_speaker_data(self, sample):
-        # We don't bridge speaker BACK to the UI from Zenoh in this specific mode 
-        # unless requested, but we could if we wanted the UI to hear Pepper's speaker.
+    def _on_zenoh_mic_data(self, sample):
+        # Receive raw PCM/Bytes from Robot via Zenoh
+        # We need to feed this into the opus_reader of the active session(s)
+        # This is tricky because 'opus_reader' is local to the 'handle_chat' coroutine.
+        # We need a way to route this global Zenoh data to the active model loop.
+        # For now, we will assume a Single-User Robot Scenario and look for an active 'opus_reader_queue'.
+        if hasattr(self, 'active_pcm_queue') and self.active_pcm_queue is not None:
+             try:
+                 payload = sample.payload.to_bytes()
+                 # logger.info(f"ZENOH RX: {len(payload)} bytes")
+                 # We simply push the payload. The main loop must decide if it is Opus or PCM.
+                 # Updated: We push RAW PCM bytes. opus_loop handles conversion.
+                 self.active_pcm_queue.put_nowait(payload)
+             except Exception:
+                 pass
+        else:
+             # logger.warning("ZENOH RX: Dropped packet (No active PCM queue)")
+             pass
+
+    def _on_zenoh_control(self, sample):
+        # Handle JSON commands
         pass
+
+    def _on_zenoh_text(self, sample):
+        # Handle raw text injection (OM1 legacy)
+        text = sample.payload.to_string()
+        logger.info(f"Received text to speak: {text}")
+        # Inject into LMGen if possible (future task)
     
     def warmup(self):
         for _ in range(4):
@@ -197,6 +236,9 @@ class ServerState:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
+        
+        # Zenoh Audio Injection Setup
+        self.active_pcm_queue = asyncio.Queue()
 
         async def recv_loop():
             nonlocal close
@@ -224,9 +266,9 @@ class ServerState:
                         payload = message[1:]
                         if self.zenoh_mic_pub:
                             # Bridge UI audio to Zenoh Pepper Mic topic
-                            # Convert to format robot expects if needed (usually mono 16bit)
-                            # For now, we assume bridge handles it or we send as is
-                            self.zenoh_mic_pub.put(payload)
+                            # This is for the scenario where Web UI sends audio TO Zenoh (e.g. for OM1)
+                            # self.zenoh_mic_pub.put(payload)
+                            pass
                         opus_reader.append_bytes(payload)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
@@ -236,24 +278,92 @@ class ServerState:
 
         async def opus_loop():
             all_pcm_data = None
+            
+            # Helper to check for Zenoh audio injection
+            # We bypass opus_reader because Robot sends raw PCM (Int16)
+            # Helper to check for Zenoh audio injection
+            # We bypass opus_reader because Robot sends raw PCM (Int16)
+            def process_zenoh_pcm():
+                 nonlocal all_pcm_data
+                 while not self.active_pcm_queue.empty():
+                     try:
+                         chunk_bytes = self.active_pcm_queue.get_nowait()
+                         # Convert Int16 (bytes) -> Float32 (numpy)
+                         # Assumes 24kHz Mono 16-bit
+                         arr_int16 = np.frombuffer(chunk_bytes, dtype=np.int16)
+                         arr_float32 = arr_int16.astype(np.float32) / 32768.0
+                         
+                         # FLATTEN to 1D to match simple time-series concatenation expected by loop
+                         arr_float32 = arr_float32.flatten()
+                         
+                         if all_pcm_data is None:
+                             all_pcm_data = arr_float32
+                         else:
+                             all_pcm_data = np.concatenate((all_pcm_data, arr_float32))
+                     except Exception:
+                         break
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+                
+                # Ingest any audio from Zenoh (Robot)
+                process_zenoh_pcm()
+                
                 pcm = opus_reader.read_pcm()
-                if pcm.shape[-1] == 0:
-                    continue
-                if all_pcm_data is None:
-                    all_pcm_data = pcm
-                else:
-                    all_pcm_data = np.concatenate((all_pcm_data, pcm))
-                while all_pcm_data.shape[-1] >= self.frame_size:
+                # Ensure pcm is flattened if needed? Usually read_pcm returns (T,) or (T, C)
+                # If it returns (C, T) we might be in trouble. 
+                # sphn usually returns (samples,) for mono.
+                if len(pcm.shape) > 1:
+                     pcm = pcm.flatten()
+
+                if pcm.shape[0] > 0:
+                    if all_pcm_data is None:
+                        all_pcm_data = pcm
+                    else:
+                        all_pcm_data = np.concatenate((all_pcm_data, pcm))
+                
+                # SAFETY: Ensure 1D and Log
+                if all_pcm_data is not None:
+                     if len(all_pcm_data.shape) > 1:
+                         all_pcm_data = all_pcm_data.reshape(-1)
+                     # logger.info(f"DEBUG: PCM Shape: {all_pcm_data.shape}")
+
+                while all_pcm_data is not None and all_pcm_data.shape[0] >= self.frame_size:
                     be = time.time()
+                    
+                    # Log once to debug frame size issue
+                    # print(f"DEBUG LOOP: Available {all_pcm_data.shape[0]}, FrameSize {self.frame_size}", flush=True)
+                    
+                    if len(all_pcm_data.shape) > 1:
+                         all_pcm_data = all_pcm_data.reshape(-1)
+                         
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
+                    
+                    # FORCE 1D
+                    chunk = chunk.reshape(-1)
+                    
                     chunk = torch.from_numpy(chunk)
-                    chunk = chunk.to(device=self.device)[None, None]
+                    
+                    # Check dimensions
+                    if chunk.dim() > 1:
+                         chunk = chunk.reshape(-1)
+                    
+                    # Ensure [B, C, T] -> [1, 1, T]
+                    # chunk is [T] (e.g. 1920)
+                    chunk = chunk.unsqueeze(0).unsqueeze(0)
+                    
+                    # Verify
+                    if chunk.dim() != 3:
+                         print(f"CRITICAL: Chunk shape mismatch {chunk.shape}. Resetting.", flush=True)
+                         continue
+                    
+                    # Move to GPU
+                    chunk = chunk.to(device=self.device)
+                         
+                    # logger.info(f"Encoding Chunk: {chunk.shape}")
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
@@ -268,6 +378,7 @@ class ServerState:
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
                             if self.zenoh_transcription_pub:
                                 logger.info(f"ZENOH PUB: {_text}")
@@ -277,6 +388,23 @@ class ServerState:
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
                     
+                    # Convert main_pcm (float32) to int16 for Robot Speaker
+                    # main_pcm shape: [1, 1, frame_size]
+                    if self.zenoh_speaker_pub:
+                         # Ensure we use the same PCM we just decoded
+                         # We already have main_pcm from the loop above, but we need to check if it's available
+                         # It is local 'main_pcm' inside the loop, we need to access it.
+                         # Wait, 'main_pcm' is overwritten in the loop. 
+                         # We must capture it inside the loop.
+                         pass 
+                         # Actually we can do it inside the 'for c' loop, or accumulate it.
+                         # The loop decodes small chunks. Sending small chunks to Zenoh is fine.
+                         # main_pcm is [1, 1, 320] roughly.
+                         # Float32 -> Int16
+                         pcm_np = main_pcm[0,0].numpy()
+                         pcm_int16 = (pcm_np * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+                         self.zenoh_speaker_pub.put(pcm_int16)
+
                     af = time.time()
                     if int(af) % 10 == 0:
                         logger.info(f"DEBUG: Processed 1 audio frame in {af - be:.2f}s (Target: 0.08s)")
@@ -349,6 +477,8 @@ class ServerState:
                 await ws.close()
                 clog.log("info", "session closed")
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+        
+        self.active_opus_reader_queue = None
         clog.log("info", "done with connection")
         return ws
 

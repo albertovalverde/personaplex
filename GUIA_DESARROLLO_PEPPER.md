@@ -1,136 +1,64 @@
-# Guía de Desarrollo Pepper (Híbrido) - Integración PersonaPlex & OM1
+# Guía Técnica de Desarrollo e Integración (Pepper 2026)
 
-Esta guía detalla la arquitectura, configuración y el puente Zenoh necesario para integrar el modelo de voz **PersonaPlex (Moshi)** con el sistema operativo robótico **OM1** para el robot Pepper.
+Este documento detalla los componentes internos y flujos de datos para desarrolladores que quieran extender el sistema.
 
----
+## 1. Topología de Red
 
-## 1. Arquitectura del Sistema Híbrido
-
-La integración se basa en un diseño desacoplado donde OM1 maneja la percepción/acción y PersonaPlex se encarga de la generación de voz fluida y natural.
-
-### Componentes:
-*   **OM1 (Cerebro Lógico)**: Ejecuta el razonamiento profundo (OpenAI/Gemini) y gestiona los sensores del robot.
-*   **PersonaPlex (Cerebro Emocional/Conversacional)**: Proporciona respuestas de baja latencia (<200ms) para charla trivial y verbaliza las respuestas del sistema lógico.
-*   **Zenoh (Bus de Comunicación)**: El "sistema nervioso" que transporta audio y comandos de control entre ambos repositorios.
-
----
-
-## 2. Instalación y Requisitos
-
-### En el repositorio PersonaPlex:
-Asegúrate de tener instalada la librería de Zenoh y las dependencias de Moshi:
-
-```bash
-# Instalación de dependencias
-./venv/bin/pip install eclipse-zenoh
+```
+[ PEPPER ROBOT ]              [ SERVIDOR / BRIDGE ]               [ CEREBRO / MOSHI ]
+(Python 2.7)                  (Python 3.10)                       (Python 3.10 + GPU)
+      |                             |                                   |
+  Mic | --(Raw TCP 9001)-->  [Socket Server] --(Zenoh Pub)-->  [Zenoh Sub: pepper/audio/mic]
+      |                             |                                   |
+Spkr | <--(Raw TCP 9001)--  [Socket Server] <--(Zenoh Sub)--  [Zenoh Pub: pepper/audio/speaker]
+      |                             |                                   |
+ Video | --(Raw TCP 9002)-->  [Socket Server] --(Zenoh Pub)-->  [Zenoh Sub: pepper/vision/camera]
+      |                             |                                   |
+Motion | <--(Raw TCP 9003)--  [Socket Server] <--(Zenoh Sub)--  [Zenoh Pub: pepper/control]
 ```
 
-El archivo `moshi/requirements.txt` debe incluir:
-```text
-eclipse-zenoh
-```
+## 2. Componentes Críticos
 
----
+### A. Moshi Server (`moshi/server.py`)
+Se ha modificado el servidor original de Kyutai para:
+1.  **Suscribirse a Zenoh**: Escucha `pepper/audio/mic`.
+2.  **Inyección Directa**: Los paquetes de audio se inyectan en `active_pcm_queue`.
+3.  **Corrección de Forma**: Se aplica `all_pcm_data.reshape(-1)` y `chunk.to(device)` para evitar errores de tensores 4D o de CPU/GPU.
+4.  **Publicación**: El audio generado se envía a `pepper/audio/speaker`.
 
-## 3. El Puente Zenoh (`scripts/zenoh_bridge.py`)
+### B. El Puente (`scripts/pepper_socket_bridge.py`)
+Es el componente más estable. Simplemente mueve bytes de izquierda a derecha.
+*   **Audio**: Full-duplex en puerto 9001.
+*   **Video**: Unidireccional en puerto 9002 (Framing con cabecera de 4 bytes para tamaño).
+*   **Control**: JSON Lines en puerto 9003.
 
-Este script es el corazón de la integración en el lado de PersonaPlex. Sus funciones principales son:
+### C. Cliente Headless (`scripts/headless_moshi_client.py`)
+Mantiene vivo el WebSocket de inferencia. Es cruicial en producción porque Moshi no procesa audio si no hay un cliente "Web" conectado. Este script simula ser ese cliente.
 
-1.  **Escuchar el Micrófono**: Se suscribe al tópico `pepper/audio/mic` para recibir audio en tiempo real desde OM1.
-2.  **Procesar Audio**: Envía los frames de audio al modelo Moshi/Mimi.
-3.  **Hablar**: Publica el audio generado por el agente en `pepper/audio/speaker`.
-4.  **Control**: Escucha comandos en `pepper/personaplex/control` para inyectar texto o prompts dinámicos.
+## 3. Protocolos
 
-### Lanzamiento Automatizado (Recomendado)
+### Audio
+*   **Formato**: PCM 16-bit, Monocanal.
+*   **Sample Rate**: 16000Hz (Robot) <-> Bridge <-> 24000Hz (Moshi). *Nota: Actualmente se inyecta directo, la conversión de SR la maneja la tolerancia del modelo o flags de ffmpeg en el simulador.*
 
-He creado un script que configura todo automáticamente (limpieza de procesos, variables de entorno, certificados y logs). Es la forma más fácil de empezar:
+### Video
+*   **Formato**: MJPEG (Secuencia de imágenes JPEG).
+*   **Transporte**: `[4 bytes Size (Big Endian)] + [JPEG Bytes]`.
 
-```bash
-# Dar permisos (solo la primera vez)
-chmod +x scripts/start_pepper.sh
+### Control
+*   **Formato**: JSON Lines (`\n`).
+*   **Schema**: `{"action": "say", "text": "..."}` o `{"action": "move", "x": 1.0}`.
 
-# Ejecutar el sistema completo
-./scripts/start_pepper.sh
-```
+## 4. Solución de Problemas (Troubleshooting)
 
----
-
-### Lanzamiento Manual (Avanzado)
-
-Si necesitas control total o depuración en vivo, puedes lanzar los componentes por separado:
-
-#### 1. Servidor (Moshi + Zenoh)
-Copia y pega este bloque completo:
-
-```bash
-export HF_TOKEN="tu_token_aqui" && \
-export REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt" && \
-SSL_DIR=$(mktemp -d) && \
-PYTHONPATH=moshi ./venv/bin/python -m moshi.server \
-    --ssl "$SSL_DIR" \
-    --voice-prompt-dir ./voices \
-    --static client/dist \
-    --zenoh \
-    --port 8998
-```
-
-> [!WARNING]
-> El flag `--ssl` requiere un argumento (el directorio donde se guardarán los certificados). Si lanzas el comando manualmente, asegúrate de definir primero la variable `SSL_DIR` como en el ejemplo de arriba. No ejecutes `--ssl` solo.
-
----
-
-## 4. Tópicos Zenoh de Integración
-
-| Tópico | Dirección (desde PersonaPlex) | Descripción |
+| Síntoma | Causa Probable | Solución |
 | :--- | :--- | :--- |
-| `pepper/audio/mic` | Entrada (Subscriber) | Audio crudo del micrófono del robot. |
-| `pepper/audio/transcription` | Salida (Publisher) | **Tiempo real**: Texto transcrito por Moshi enviado a OM1. |
-| `pepper/audio/speaker` | Salida (Publisher) | Audio generado por Moshi para los altavoces. |
-| `pepper/personaplex/control` | Entrada (Subscriber) | Comandos de control e inyección de texto desde OM1. |
+| **Error `RuntimeError: devices cpu and cuda:0`** | Falta mover tensores a GPU. | Verificar `chunk.to(device)` en `server.py`. (Ya parcheado) |
+| **Error `Shape mismatch [1,1,1,T]`** | Tensores no aplanados. | Verificar `reshape(-1)` en `server.py`. (Ya parcheado) |
+| **"Socket not connected" en logs web** | Conflicto Headless/Web. | Cerrar `headless_moshi_client.py` si usas Web, o viceversa. |
+| **Robot no habla** | Falta sesión activa. | Asegurar que Web UI o Headless Client están corriendo. |
 
----
-
-## 5. Visualización en Tiempo Real (WebSim)
-
-El simulador de OM1 (puerto `8005`) ha sido optimizado para mostrar feedback instantáneo:
-
-*   **UI Desacoplada**: El historial de entrada ("Input History") se actualiza cada 0.5s leyendo directamente del bus Zenoh. No depende de que el cerebro termine de procesar.
-*   **Transparencia**: Puedes ver las palabras aparecer en el simulador mientras el usuario habla en la interfaz web de Moshi.
-
----
-
-## 6. Flujo de Trabajo para Demos
-
-Para una ejecución exitosa de la demo híbrida de Pepper:
-
-1.  **Iniciar OM1**: Ejecuta `python src/run.py pepper`.
-2.  **Iniciar PersonaPlex**: Ejecuta el servidor con el flag `--zenoh`.
-3.  **Verificación**:
-    *   Abre `https://localhost:8998` para hablar.
-    *   Abre `http://localhost:8005` para ver la visualización de Pepper.
-    *   Verás el texto de tu voz aparecer instantáneamente en el "Input History".
-
----
-
-## 7. Notas de Desarrollo y Estrategia
-
-*   **Barge-in**: PersonaPlex soporta interrupciones naturales. Si el usuario habla mientras Pepper responde, el modelo detectará la interrupción automáticamente.
-*   **Loop de Cortex**: El núcleo de OM1 está configurado para no bloquearse. Si una respuesta del LLM es lenta, el robot sigue refrescando su estado y visualización.
-*   **Voz de Pepper**: El archivo `voices/pepper.pt` es crítico para mantener la identidad sonora del robot.
-
-## 7. Resolución de Problemas (Troubleshooting)
-
-### Error: CUDA Out of Memory
-Si al lanzar el servidor obtienes un error de memoria (OOM), es probable que haya procesos antiguos bloqueando la GPU. Usa este comando para limpiar la memoria:
-
-```bash
-pkill -9 -f "moshi|zenoh_bridge"
-```
-
-### Error de JavaScript: `addModule` en la Web
-Si ves un error de JavaScript o el micro no se activa, asegúrate de estar accediendo por **HTTPS**. El navegador bloquea las APIs de audio en conexiones inseguras (HTTP).
-
----
-
-> [!IMPORTANT]
-> Esta arquitectura permite actualizar OM1 de forma independiente sin afectar la lógica específica de audio y voz que reside en este repositorio PersonaPlex.
+## 5. Futuras Mejoras
+*   Implementar re-sampling real de alta calidad (SoX) en el Bridge.
+*   Añadir compresión Opus en el tramo Robot->Bridge para redes lentas.
+*   Integrar OM1 (Llama 3) para la toma de decisiones basada en el topic `pepper/audio/transcription`.
